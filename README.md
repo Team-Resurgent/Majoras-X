@@ -13,16 +13,10 @@ it is made on your own machine.
 | --- | --- | --- |
 | USA 1.0 (N64) | `d6133ace5afaa0882cf214cf88daba39e266c078` | tested |
 
-2Ship2Harkinian also extracts the USA GameCube and Japanese GameCube versions; the build
-accepts them, but only the N64 USA ROM has been tested on the Xbox.
-
 ## Features
 
 * The full game, with 2Ship2Harkinian's fixes and enhancements
 * 720p, 480p or 480i, following the dashboard's video settings, in 16:9
-* Up to 60 frames a second: the game runs at its own 20 ticks a second and the frames in
-  between are drawn from 2Ship2Harkinian's frame interpolation, with a frame rate limit
-  (Auto, 40, 30, 20) for a steadier picture
 * An optional widescreen HUD, at the edges of the 16:9 screen
 * An in-game menu on **Back**: fully remappable controls, options and cheats
 * Options for autosave, owl saves that last, skipping cutscenes, faster text, songs and
@@ -30,7 +24,6 @@ accepts them, but only the N64 USA ROM has been tested on the Xbox.
   style, motion blur, sound volumes and many more of 2Ship2Harkinian's enhancements
 * Each save file is its own Xbox save game, managed from the dashboard
 * Rumble, with full, medium and low strengths
-* Runs on a stock 64 MB console
 
 ## Requirements
 
@@ -103,11 +96,7 @@ Each of the three save files is its own Xbox save game, named after its slot and
 ("File 1 - Link"), which the dashboard lists under **Memory > Majora's-X** and can copy or
 delete on its own; erasing or copying a file on the file select does the same to its save
 game. The settings are kept apart, in the game's own folder (`E:\TDATA\54520021`), and
-survive deleting a save. Settings and saves from the earlier Lus-X test builds are brought
-over into these places the first time the game starts.
-
-Under xemu, turn **GPU vertex buffers** off (Options > Display): xemu draws them slower than
-a console does. The change takes full effect the next time the game is launched.
+survive deleting a save.
 
 ## What is in this repository
 
@@ -129,5 +118,5 @@ a console does. The change takes full effect the next time the game is launched.
 * [libultraship](https://github.com/Kenix3/libultraship),
   [ZAPDTR](https://github.com/HarbourMasters/ZAPDTR) and
   [OTRExporter](https://github.com/HarbourMasters/OTRExporter)
-* UltraX, for the MMX audio mixer
 * the RXDK, by Team Resurgent
+* Grand_Ferik for testing and reporting all bugs
