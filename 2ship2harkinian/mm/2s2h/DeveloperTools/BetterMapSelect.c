@@ -518,7 +518,9 @@ s32 BetterMapSelect_Spawns(s32 scene) {
 }
 
 // A scene's cutscene n is its layer n + 1, and an entrance's layers are one short array each, of no recorded length:
-// past its end is another entrance's, a different spawn or scene. The map select reads on regardless.
+// past its end is another entrance's, a different spawn or scene. The map select reads on regardless. A layer's scene
+// can be negative (Termina Field's entrance 0, whose cutscene 7 is the ending): the same scene, so it's compared
+// without its sign, as Entrance_GetSceneIdAbsolute does
 static bool BetterMapSelect_HasLayer(s32 scene, s32 spawn, s32 layer) {
     const EntranceTableEntry* entries;
 
@@ -527,7 +529,7 @@ static bool BetterMapSelect_HasLayer(s32 scene, s32 spawn, s32 layer) {
     }
     entries = sSceneEntranceTable[sBetterScenes[scene].entrance >> 9].table[spawn];
     for (s32 i = 1; i <= layer; i++) {
-        if (entries[i].sceneId != entries[0].sceneId || entries[i].spawnNum != entries[0].spawnNum) {
+        if (ABS_ALT(entries[i].sceneId) != ABS_ALT(entries[0].sceneId) || entries[i].spawnNum != entries[0].spawnNum) {
             return false;
         }
     }
@@ -555,9 +557,13 @@ void BetterMapSelect_Warp(s32 scene, s32 spawn, s32 form, s32 day, s32 stage) {
     gSaveContext.minigameStatus = MINIGAME_STATUS_INACTIVE;
     gSaveContext.save.playerForm = form;
     gSaveContext.save.day = day;
+    // a cutscene goes in as a transition's does (Boss07's to the ending: nextCutsceneIndex 0xFFF7): Play_Init copies
+    // nextCutsceneIndex over cutsceneIndex, and with 0xFFEF there it would pick its own for some scenes (Termina Field
+    // without the Ocarina: the empty first-cycle field, cutscene 4)
     gSaveContext.save.cutsceneIndex = 0;
+    gSaveContext.nextCutsceneIndex = 0xFFEF;
     if (stage >= 4) {
-        gSaveContext.save.cutsceneIndex = 0xFFF0 + stage - 4;
+        gSaveContext.nextCutsceneIndex = 0xFFF0 + stage - 4;
     } else if (stage >= 1) {
         gSaveContext.save.cutsceneIndex = kStages[stage - 1];
     }

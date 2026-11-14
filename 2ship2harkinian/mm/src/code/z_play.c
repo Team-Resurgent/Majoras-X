@@ -2625,5 +2625,12 @@ void Play_Init(GameState* thisx) {
     XBOX_WHERE("Play_Init: the scene-init hooks");
     GameInteractor_ExecuteOnSceneInit(sceneIdAbsolute, spawnNum);
     XBOX_WHERE("Play_Init: done");
-    LusxDebug_Mark("Play_Init: done");
+#if LUSX_DEBUG_TOOLS
+    {
+        char mark[48];
+
+        snprintf(mark, sizeof(mark), "Play_Init: done, scene layer %d", sceneLayer);
+        LusxDebug_Mark(mark);
+    }
+#endif
 }
