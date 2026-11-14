@@ -9,6 +9,10 @@
 
 #include "lusx_debug_config.h" /* written by tools/build.py into build/gen */
 
+#ifndef LUSX_PGO_GEN
+#define LUSX_PGO_GEN 0 /* 1 in the profile-guided build's training run (build.py --pgo-gen): lusx_debug.cpp saves the counts */
+#endif
+
 #if LUSX_DEBUG_TOOLS
 
 #ifdef __cplusplus

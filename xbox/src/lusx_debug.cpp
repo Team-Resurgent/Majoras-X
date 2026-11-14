@@ -88,6 +88,47 @@ static volatile int sShown;
 static char sLastRun[OVERLAY_LINES][OVERLAY_COLUMNS];
 static bool sHaveLastRun;
 
+#if LUSX_PGO_GEN
+// The profile-guided build's training run (tools/build.py --pgo-gen): clang's -fprofile-generate counts each branch into
+// .lprfc. No compiler-rt here: its runtime is this. __llvm_profile_runtime is the symbol the instrumented code asks for;
+// the two markers sort before and after every object's counters (.lprfc$M) in the linked section. Every PGO_EVERY_MS
+// the counters go to T:\lusx_pgo.bin as they are (a header, then the bytes); `build.py --pgo-merge` turns that into
+// the profile with the linked exe's records and names. Written to a part file and moved, so a power-off mid-write
+// leaves the last one.
+extern "C" {
+int __llvm_profile_runtime;
+__attribute__((section(".lprfc$A"), aligned(8))) unsigned long long lusxPgoCountersA;
+__attribute__((section(".lprfc$Z"), aligned(8))) unsigned long long lusxPgoCountersZ;
+}
+#define PGO_PATH "T:\\lusx_pgo.bin"
+#define PGO_PART "T:\\lusx_pgo_part.bin"
+#define PGO_EVERY_MS 30000
+static DWORD sPgoSavedMs;
+static unsigned long sPgoSaves;
+
+static void SavePgo(DWORD now) {
+    const unsigned char* begin = (const unsigned char*)(&lusxPgoCountersA + 1);
+    const unsigned char* end = (const unsigned char*)&lusxPgoCountersZ;
+    struct {
+        char magic[8];
+        unsigned long va, bytes, saves, seconds;
+    } head = { { 'L', 'X', 'P', 'G', 'O', '1', 0, 0 }, (unsigned long)begin, (unsigned long)(end - begin), ++sPgoSaves,
+               (now - sStartMs) / 1000 };
+    HANDLE h = CreateFileA(PGO_PART, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    DWORD written = 0, written2 = 0;
+    const bool ok = WriteFile(h, &head, sizeof(head), &written, NULL) && written == sizeof(head) &&
+                    WriteFile(h, begin, head.bytes, &written2, NULL) && written2 == head.bytes;
+    CloseHandle(h);
+    if (ok) {
+        DeleteFileA(PGO_PATH);
+        MoveFileA(PGO_PART, PGO_PATH);
+    }
+}
+#endif
+
 static void Led(unsigned sequence) {
     HalWriteSMBusValue(SMC_ADDRESS, SMC_LED_SEQUENCE, 0, sequence);
     HalWriteSMBusValue(SMC_ADDRESS, SMC_LED_OVERRIDE, 0, 1);
@@ -430,6 +471,12 @@ extern "C" void LusxDebug_Tick(const char* where, long frames) {
     if (asked != sFlushDone || second) {
         WriteBox(); // (nothing while the black box isn't open: Logging off)
     }
+#if LUSX_PGO_GEN
+    if (now - sPgoSavedMs >= PGO_EVERY_MS || (asked != sFlushDone && sState[0] == 'e')) { // (and on the way out)
+        SavePgo(now);
+        sPgoSavedMs = now;
+    }
+#endif
     sFlushDone = asked;
 }
 

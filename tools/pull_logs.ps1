@@ -16,7 +16,8 @@ $DefaultXbox = "192.168.1.50" # the console's IP: edit to yours
 if ($Xbox -eq "") { $Xbox = $DefaultXbox }
 
 $titleDir = "TDATA/54520021"
-$files = "lusx.log", "lusx_part.log", "lusx_prev.log", "lusx_box.txt"
+# (lusx_pgo.bin: the profile-guided build's training run only, the counts for build.py --pgo-merge)
+$files = "lusx.log", "lusx_part.log", "lusx_prev.log", "lusx_box.txt", "lusx_pgo.bin"
 $dir = Join-Path $Out (Get-Date -Format "yyyy-MM-dd_HH-mm-ss")
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 

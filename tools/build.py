@@ -5,6 +5,7 @@ setup.py runs this once the archives are in data/; run on its own, it rebuilds t
 
     python tools/build.py [-k] [-j N] [--only GROUP[,GROUP]] [--file PATTERN]
                           [--no-link] [--clean] [--cmd PATTERN] [--no-lto]
+                          [--pgo-gen | --pgo-merge SAVE [SAVE ...] | --no-pgo]
 
 Compiles with the RXDK's clang and the flags its Rxdk.Cli uses (copied from
 `Rxdk.Cli build --verbose`), then links, runs imagebld and packs the disc the
@@ -35,6 +36,22 @@ hooks stay in; --gc-sections drops what nothing reaches.
 There is one build. The test tools (xbox/include/lusx_debug.h: the log and
 black box files, the LED signal and the overlay) are in it, off until the port
 menu's Debug page turns them on (Logging, Test overlay).
+
+Profile-guided optimisation, in three steps:
+
+    build.py --pgo-gen          the training build: every function counts its
+                                branches (out/PGO/XISO/Majoras-X-PGO.iso).
+                                Play it (the slow scenes most); it saves the
+                                counts to T:\\lusx_pgo.bin every 30 seconds
+                                (tools/pull_logs.ps1 copies it off)
+    build.py --pgo-merge F...   those saves into xbox/pgo/majoras-x.profdata
+                                (Visual Studio's llvm-profdata)
+    build.py                    every build uses the profile while it's there
+                                (--no-pgo: without it)
+
+A source changed since the training run builds that function without its
+counts (clang matches each function by a hash of its branches); the rest keep
+theirs. Train again when much has changed.
 """
 import argparse
 import concurrent.futures
@@ -43,6 +60,7 @@ import hashlib
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -83,6 +101,43 @@ LTO = True
 # lld imports a function into its callers up to this size; its default of 100 grew Prime-X's .text 37%, which a 64 MB
 # console pays for and a 16 KB L1 doesn't repay
 LTO_IMPORT_LIMIT = 10
+
+# Profile-guided optimisation (Melee-X: +11.6% with LTO, its biggest compiler win): the groups that count their branches
+# in the training build and are built with the counts after it. deps is cold; of port (2Ship's C++, -Os, mostly cold)
+# only its hot files (the group's "hot" list) count. The training build has to run on a stock 64 MB console.
+PGO_GROUPS = ("lus", "game", "port", "xbox")
+PGO_HOT_ONLY = ("port",)
+PGO_PROFILE = os.path.join(XBOX, "pgo", "majoras-x.profdata")
+PGO = None  # "gen" (the training build), "use" (the profile is there) or None
+
+
+def variant():
+    """The training build's files apart from the normal build's (objects, libraries, the exe, the disc)."""
+    return "-pgogen" if PGO == "gen" else ""
+
+
+_pgo_stamp = None
+
+
+def pgo_flags(g, src=None):
+    """The profile's flags for a source of g (None: g's precompiled header)."""
+    global _pgo_stamp
+    if PGO is None or g["name"] not in PGO_GROUPS:
+        return []
+    if g["name"] in PGO_HOT_ONLY and (src is None or not any(re.search(h, rel(src)) for h in g.get("hot", []))):
+        return [] # (a hot file takes its headers as text, not from the PCH: the PCH stays without)
+    # static functions named without the file's path: the profile matches whichever folder builds it
+    common = ["-mllvm", "-static-func-full-module-prefix=false"]
+    if PGO == "gen":
+        # no value profiling: it calls into compiler-rt's runtime, which the RXDK doesn't have
+        return ["-fprofile-generate", "-mllvm", "-disable-vp"] + common
+    if _pgo_stamp is None:
+        with open(PGO_PROFILE, "rb") as fh:
+            _pgo_stamp = hashlib.sha1(fh.read()).hexdigest()[:12]
+    # the stamp: a new profile recompiles (the path alone wouldn't). Functions changed since the training run are
+    # built as without a profile, which clang would warn of in each file
+    return ["-fprofile-use=" + PGO_PROFILE, "-DLUSX_PGO_PROFILE=0x" + _pgo_stamp, "-Wno-profile-instr-out-of-date",
+            "-Wno-profile-instr-unprofiled", "-Wno-profile-instr-missing", "-Wno-backend-plugin"] + common
 
 
 def clang_resource_inc():
@@ -306,8 +361,10 @@ def write_if_changed(path, text):
 def generate():
     # a header and not a -D, so switching rebuilds only the files that include it: a -D is in every command. 1: the test
     # tools are in every build, off until the Debug page turns them on; 0 here would leave them out
+    # LUSX_PGO_GEN: the training build's runtime (xbox/src/lusx_debug.cpp), which saves the counts
     for inc in ("lus", "mm"):
-        write_if_changed(os.path.join(GEN, inc, "lusx_debug_config.h"), "#define LUSX_DEBUG_TOOLS 1\n")
+        write_if_changed(os.path.join(GEN, inc, "lusx_debug_config.h"),
+                         "#define LUSX_DEBUG_TOOLS 1\n#define LUSX_PGO_GEN %d\n" % (1 if PGO == "gen" else 0))
     write_if_changed(os.path.join(GEN, "stb_impl.c"),
                      "#define STB_IMAGE_IMPLEMENTATION\n#define STBI_NO_THREAD_LOCALS\n#define STBI_NO_SIMD\n#include \"stb_image.h\"\n")
     write_if_changed(os.path.join(GEN, "lus", "ship", "install_config.h"),
@@ -338,7 +395,7 @@ def obj_path(group, src):
     if r.startswith(".."):
         r = os.path.basename(src)
     # bitcode and native objects apart, so a --no-lto build never recompiles the other's
-    obj = "obj-lto" if LTO and group in LTO_GROUPS else "obj"
+    obj = ("obj-lto" if LTO and group in LTO_GROUPS else "obj") + variant()
     return os.path.join(BUILD, obj, group, os.path.splitext(r)[0] + ".obj")
 
 
@@ -348,7 +405,7 @@ def lang_of(src):
 
 def compile_cmd(g, src, obj, pch=None):
     lang = lang_of(src)
-    cmd = [CLANG] + rxdk_flags(lang) + g["extra"] + g["defs"]
+    cmd = [CLANG] + rxdk_flags(lang) + g["extra"] + g["defs"] + pgo_flags(g, src)
     for inc in g["incs"]:
         cmd += ["-I", inc]
     cmd += ["-I", SDK_INC]
@@ -401,12 +458,12 @@ def build_pch(g, lang):
     headers = g.get("pch")
     if not headers:
         return None
-    hdr = os.path.join(GEN, "pch", "%s_%s.h" % (g["name"], lang.replace("+", "x")))
+    hdr = os.path.join(GEN, "pch" + variant(), "%s_%s.h" % (g["name"], lang.replace("+", "x")))
     text = "".join('#include "%s"\n' % h.replace("\\", "/") if os.path.isabs(h) else "#include <%s>\n" % h
                    for h in headers)
     write_if_changed(hdr, text)
     out = hdr + ".pch"
-    cmd = [CLANG] + rxdk_flags(lang) + g["extra"] + g["defs"]
+    cmd = [CLANG] + rxdk_flags(lang) + g["extra"] + g["defs"] + pgo_flags(g)
     for inc in g["incs"]:
         cmd += ["-I", inc]
     cmd += ["-I", SDK_INC, "-x", lang + "-header", hdr, "-o", out, "-MD", "-MF", out + ".d"]
@@ -519,7 +576,7 @@ EH_END = ('.section .eh_frame$z,"dr"\n.globl ___eh_frame_end\n.globl ___rxdk_eh_
 def archive(name, objs):
     """deps and libultraship as static libraries, as on the PC: an object is linked only when
     something needs it (2Ship's own stubs.c stands in for several of LUS's libultra files)."""
-    lib = os.path.join(BUILD, "lib", name + ("-lto" if LTO and name in LTO_GROUPS else "") + ".lib")
+    lib = os.path.join(BUILD, "lib", name + ("-lto" if LTO and name in LTO_GROUPS else "") + variant() + ".lib")
     os.makedirs(os.path.dirname(lib), exist_ok=True)
     if os.path.isfile(lib) and all(os.path.getmtime(o) <= os.path.getmtime(lib) for o in objs):
         return lib
@@ -532,6 +589,28 @@ def archive(name, objs):
     if r.returncode != 0:
         raise SystemExit("build: archiving %s failed" % name)
     return lib
+
+
+XBE_PRELOAD = 2  # a section header's flag: the kernel loads the section with the title (else XLoadSection does)
+
+
+def xbe_no_preload(xbe, names):
+    """Clears the preload flag of the named sections in an XBE's section headers; returns their total size."""
+    with open(xbe, "r+b") as fh:
+        d = bytearray(fh.read())
+        base, = struct.unpack_from("<I", d, 0x104)
+        count, headers = struct.unpack_from("<II", d, 0x11C)
+        left = 0
+        for i in range(count):
+            h = headers - base + 56 * i
+            flags, _va, vsize, _raw, _raw_size, name_at = struct.unpack_from("<6I", d, h)
+            name = bytes(d[name_at - base:d.index(b"\0", name_at - base)]).decode("ascii", "replace")
+            if name in names and flags & XBE_PRELOAD:
+                struct.pack_into("<I", d, h, flags & ~XBE_PRELOAD)
+                left += vsize
+        fh.seek(0)
+        fh.write(d)
+    return left
 
 
 def link(objs):
@@ -550,11 +629,11 @@ def link(objs):
     rsp = os.path.join(lk, "objs.rsp")
     with open(rsp, "w", encoding="utf-8") as fh:
         fh.write("\n".join('"%s"' % o.replace("\\", "/") for o in objs) + "\n")
-    exe = os.path.join(BUILD, TITLE + ".exe")
+    exe = os.path.join(BUILD, TITLE + variant() + ".exe")
     cmd = [CLANG, eh[0], "@" + rsp] + [os.path.join(SDK_LIB, l) for l in LIBS] + [builtins_lib(), eh[1],
            "-target", "i686-pc-windows-gnu", "-march=pentium3", "-nostdlib", "-nostartfiles",
            "-Wl,--image-base=0x10000", "-Wl,--gc-sections", "-Wl,--error-limit=0",
-           "-Wl,-Map=" + os.path.join(lk, TITLE + ".map"),
+           "-Wl,-Map=" + os.path.join(lk, TITLE + variant() + ".map"),
            # xbox_glue.cpp's strlen, which names the caller of a strlen on a bad pointer
            "-Wl,--wrap=strlen",
            "-fuse-ld=lld", "-e", "XapiTitleStartup", "-o", exe]
@@ -563,7 +642,7 @@ def link(objs):
         # without it LTO quietly makes native TLS (__tls_index). The cache: a file's change recompiles that module.
         cmd += ["-Wl,-mllvm,-emulated-tls", "-Wl,-mllvm,-import-instr-limit=%d" % LTO_IMPORT_LIMIT,
                 "-Wl,--thinlto-jobs=%d" % (os.cpu_count() or 4),
-                "-Wl,--thinlto-cache-dir=" + os.path.join(BUILD, "lto-cache").replace("\\", "/")]
+                "-Wl,--thinlto-cache-dir=" + os.path.join(BUILD, "lto-cache" + variant()).replace("\\", "/")]
     print("build: linking %d objects" % len(objs))
     rc, out = run(cmd, os.path.join(BUILD, "log", "link.log"))
     if rc != 0:
@@ -572,19 +651,28 @@ def link(objs):
         for u in undef[:60]:
             print("  " + u)
         raise SystemExit(1)
-    xbe = os.path.join(BUILD, TITLE + ".xbe")
+    xbe = os.path.join(BUILD, TITLE + variant() + ".xbe")
     # the dashboard's title and save images, made from the title screen's Majora's Mask (tools/make_icons.py)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import make_icons
     icons = make_icons.main()
     images = ["/TITLEIMAGE:" + icons[0], "/DEFAULTSAVEIMAGE:" + icons[1]] if icons else []
+    # the training build: the same title ID (its T:, where it saves the counts, is the game's), a name of its own
+    name = TITLE_NAME + (" (PGO run)" if PGO == "gen" else "")
     r = subprocess.run([os.path.join(RXDK, "tools", "imagebld.exe"), "/in:" + exe, "/out:" + xbe, "/nologo",
                         "/stack:%d" % STACK, "/nolibwarn", "/TESTID:" + TITLE_ID, "/TESTALTID:" + OLD_TITLE_ID,
-                        "/TESTNAME:" + TITLE_NAME, "/TESTVERSION:1"] + images, capture_output=True, text=True)
+                        "/TESTNAME:" + name, "/TESTVERSION:1"] + images, capture_output=True, text=True)
     if r.returncode != 0:
         sys.stdout.write(r.stdout + r.stderr)
         raise SystemExit("build: imagebld failed")
-    out = os.path.join(ROOT, "out", "Release")
+    if PGO == "gen":
+        # the console needs only the counters (.lprfc): the functions' records and names (.lprfd, .lprfn, ~10 MB) are
+        # read on the PC from the exe (--pgo-merge). imagebld keeps every section before .reloc (marked discardable or
+        # renamed, they stayed; llvm-objcopy's exe without them it calls corrupt), so the title loads them without
+        # their preload flag: the kernel then never reads them in, and nothing on the console touches them
+        print("build: the training title leaves out %.1f MB of the profile's records and names" %
+              (xbe_no_preload(xbe, (".lprfd", ".lprfn")) / 1048576.0))
+    out = os.path.join(ROOT, "out", "PGO" if PGO == "gen" else "Release")
     stage = os.path.join(out, "Build", TITLE)
     if os.path.isdir(stage):
         shutil.rmtree(stage)
@@ -596,7 +684,7 @@ def link(objs):
     for a in archives:
         shutil.copy(a, stage)
     os.makedirs(os.path.join(out, "XISO"), exist_ok=True)
-    iso = os.path.join(out, "XISO", TITLE + ".iso")
+    iso = os.path.join(out, "XISO", TITLE + ("-PGO" if PGO == "gen" else "") + ".iso")
     r = subprocess.run([os.path.join(RXDK, "tools", "xdvdfs.exe"), "pack", stage, iso], capture_output=True,
                        text=True)
     if r.returncode != 0:
@@ -609,6 +697,130 @@ def link(objs):
     sys.stdout.write(size.stdout)
 
 
+# ---------------------------------------------------------------- the profile
+
+def pe_sections(exe):
+    """A PE's sections by name: (virtual address, contents to the virtual size)."""
+    with open(exe, "rb") as fh:
+        data = fh.read()
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    count, = struct.unpack_from("<H", data, pe + 6)
+    opt_size, = struct.unpack_from("<H", data, pe + 20)
+    base, = struct.unpack_from("<I", data, pe + 24 + 28)
+    out = {}
+    for i in range(count):
+        name, vsize, va, raw_size, raw_ptr = struct.unpack_from("<8sIIII", data, pe + 24 + opt_size + 40 * i)
+        body = data[raw_ptr:raw_ptr + min(vsize, raw_size)]
+        out[name.rstrip(b"\0").decode("ascii", "replace")] = (base + va, body + b"\0" * (vsize - len(body)))
+    return out
+
+
+# The RXDK's clang writes raw profile version 11, whose 32-bit function record is 56 bytes: NameRef, FuncHash (8 each),
+# CounterPtr, BitmapPtr, a pointer new in 11, FunctionPointer, Values, NumCounters (4 each), NumValueSites (3 x 2),
+# a field new in 11 (2), NumBitmapBytes (4), padding. llvm-profdata 22 (Visual Studio's) reads version 10, 48 bytes:
+# the same less the two new fields. CounterPtr is relative to its record, so it's made again for the record's new place.
+PGO_RECORD_IN, PGO_RECORD_OUT = 56, 48
+PGO_MAGIC_32 = (255 << 56) | (ord("l") << 48) | (ord("p") << 40) | (ord("r") << 32) | (ord("o") << 24) | \
+               (ord("f") << 16) | (ord("R") << 8) | 129
+PGO_VERSION = (1 << 56) | 10  # an IR-level profile, raw version 10
+
+
+def pgo_raw(exe, save, out):
+    """One T:\\lusx_pgo.bin (lusx_debug.cpp's SavePgo: a header, then the counters as they were) and the training
+    build's exe (the records and names) into a .profraw. Returns (saves, seconds) from the header."""
+    secs = pe_sections(exe)
+    if ".lprfd" not in secs or ".lprfc" not in secs or ".lprfn" not in secs:
+        raise SystemExit("build: %s has no profile sections: is it the --pgo-gen build's?" % rel(exe))
+    d_va, records = secs[".lprfd"]
+    c_va_exe, c_sec = secs[".lprfc"]
+    names = secs[".lprfn"][1]
+    with open(save, "rb") as fh:
+        blob = fh.read()
+    magic, c_va, c_bytes, saves, seconds = struct.unpack_from("<8sIIII", blob, 0)
+    if magic != b"LXPGO1\0\0":
+        raise SystemExit("build: %s isn't a counts file (T:\\lusx_pgo.bin)" % save)
+    # the markers: 8 bytes before the counters and 8 after
+    if c_va != c_va_exe + 8 or c_bytes != len(c_sec) - 16:
+        raise SystemExit("build: %s is from another build than %s (counters at 0x%X, %d bytes; this one's at 0x%X, "
+                         "%d): build --pgo-gen again or use that build's save" %
+                         (save, rel(exe), c_va, c_bytes, c_va_exe + 8, len(c_sec) - 16))
+    counters = blob[24:24 + c_bytes]
+    if len(counters) != c_bytes:
+        raise SystemExit("build: %s is cut short (%d of %d bytes of counters)" % (save, len(counters), c_bytes))
+    if len(records) % PGO_RECORD_IN:
+        raise SystemExit("build: .lprfd is %d bytes, not a whole number of %d-byte records: has the RXDK's clang "
+                         "changed its profile format?" % (len(records), PGO_RECORD_IN))
+    n = len(records) // PGO_RECORD_IN
+    delta = n * PGO_RECORD_OUT  # the header's CountersDelta: as if the counters followed the records
+    body = bytearray()
+    for i in range(n):
+        r = records[i * PGO_RECORD_IN:(i + 1) * PGO_RECORD_IN]
+        name_ref, func_hash, ctr_rel, _bitmap, _new, fn, values, num_ctrs = struct.unpack_from("<QQiiiIII", r, 0)
+        sites = r[40:46]
+        offset = (d_va + i * PGO_RECORD_IN + ctr_rel) - c_va
+        if offset < 0 or offset + 8 * num_ctrs > c_bytes:
+            raise SystemExit("build: record %d's counters lie outside .lprfc" % i)
+        body += struct.pack("<QQIIIII6s2xI", name_ref, func_hash, (offset + delta - i * PGO_RECORD_OUT) & 0xFFFFFFFF,
+                            0, fn, values, num_ctrs, sites, 0)
+
+    def pad(k):
+        return b"\0" * ((-k) % 8)
+
+    header = struct.pack("<16Q", PGO_MAGIC_32, PGO_VERSION, 0, n, 0, c_bytes // 8, (-c_bytes) % 8, 0, 0, len(names),
+                         delta, 0, secs[".lprfn"][0], 0, 0, 2)
+    with open(out, "wb") as fh:
+        fh.write(header + bytes(body) + counters + pad(c_bytes) + names + pad(len(names)))
+    return saves, seconds
+
+
+def find_profdata():
+    """llvm-profdata, the newest found: $LLVM_PROFDATA, Visual Studio's Clang tools, the PATH."""
+    found = [os.environ.get("LLVM_PROFDATA", "")]
+    for root in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+        found += glob.glob(os.path.join(root, "Microsoft Visual Studio", "*", "*", "VC", "Tools", "Llvm", "x64", "bin",
+                                        "llvm-profdata.exe"))
+    found.append(shutil.which("llvm-profdata") or "")
+    best, best_ver = None, (0,)
+    for p in found:
+        if not p or not os.path.isfile(p):
+            continue
+        r = subprocess.run([p, "--version"], capture_output=True, text=True)
+        m = re.search(r"LLVM version (\d+)\.(\d+)", r.stdout)
+        ver = (int(m.group(1)), int(m.group(2))) if m else (0,)
+        if best is None or ver > best_ver:
+            best, best_ver = p, ver
+    if best is None or best_ver < (19,):
+        raise SystemExit("build: no llvm-profdata 19 or later: install Visual Studio's \"C++ Clang tools for Windows\" "
+                         "or set LLVM_PROFDATA")
+    return best
+
+
+def pgo_merge(saves):
+    exe = os.path.join(BUILD, TITLE + "-pgogen.exe")
+    if not os.path.isfile(exe):
+        raise SystemExit("build: no %s: the counts are read with the training build's exe (build.py --pgo-gen)" %
+                         rel(exe))
+    profdata = find_profdata()
+    raw_dir = os.path.join(BUILD, "pgo")
+    os.makedirs(raw_dir, exist_ok=True)
+    raws = []
+    for i, s in enumerate(saves):
+        raw = os.path.join(raw_dir, "save%d.profraw" % i)
+        count, seconds = pgo_raw(exe, s, raw)
+        print("build: %s: save %d, %d min of play" % (s, count, seconds // 60))
+        raws.append(raw)
+    os.makedirs(os.path.dirname(PGO_PROFILE), exist_ok=True)
+    r = subprocess.run([profdata, "merge", "-o", PGO_PROFILE] + raws, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.stdout.write(r.stdout + r.stderr)
+        raise SystemExit("build: llvm-profdata merge failed")
+    r = subprocess.run([profdata, "show", PGO_PROFILE], capture_output=True, text=True)
+    print("build: %s (%d KB, by %s)" % (rel(PGO_PROFILE), os.path.getsize(PGO_PROFILE) >> 10, profdata))
+    sys.stdout.write("".join("  " + l + "\n" for l in r.stdout.splitlines() if l.strip()))
+    print("build: every build uses it now; build again for the game with it")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-k", "--keep-going", action="store_true")
@@ -619,9 +831,18 @@ def main():
     ap.add_argument("--no-link", action="store_true")
     ap.add_argument("--clean", action="store_true")
     ap.add_argument("--no-lto", action="store_true", help="native objects: a quicker link, or to compare")
+    ap.add_argument("--pgo-gen", action="store_true", help="the training build, which counts (out/PGO)")
+    ap.add_argument("--pgo-merge", nargs="+", metavar="SAVE", help="the training run's saves into the profile")
+    ap.add_argument("--no-pgo", action="store_true", help="build without the profile")
     a = ap.parse_args()
-    global LTO
+    global LTO, PGO
     LTO = not a.no_lto
+    if a.pgo_merge:
+        pgo_merge(a.pgo_merge)
+        return
+    PGO = "gen" if a.pgo_gen else "use" if os.path.isfile(PGO_PROFILE) and not a.no_pgo else None
+    if PGO == "use":
+        print("build: with the profile %s (--no-pgo: without)" % rel(PGO_PROFILE))
     if a.clean and os.path.isdir(BUILD):
         shutil.rmtree(BUILD)
     generate()
