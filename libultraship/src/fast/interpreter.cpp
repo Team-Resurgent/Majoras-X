@@ -165,6 +165,59 @@ struct XboxTimed {
 static uint32_t sXboxCpuWhy[5], sXboxCpuCulled;
 static uint32_t sXboxClampWhy[2]; // clamped triangles: cut across limbs (on the GPU), refused the cut
 static uint32_t sXboxHwWhy[2];    // HwTriangle's refusals: more than 4 combiner inputs, the LOD fraction
+// texture loads (G_LOADBLOCK, G_LOADTILE), and those of what was loaded already (no change: the fast path goes on);
+// G_CULLDL's tests, and the display lists they ended (out of sight)
+static uint32_t sXboxTexLoads, sXboxTexLoadsSame, sXboxCullTests, sXboxCulled;
+// G_SETTILE's changes, and those to a tile the triangles don't draw from (the load tile: the fast path goes on)
+static uint32_t sXboxTileSets, sXboxTileSetsUndrawn;
+// the last palette load (GfxDpLoadTlut), forgotten at each frame's start and with the texture cache: the game may
+// write a new palette where the last one was
+struct XboxLastTlut {
+    const uint8_t* src;
+    uint32_t tmem, count;
+};
+static XboxLastTlut sXboxLastTlut = { nullptr, UINT32_MAX, 0 };
+
+// What a texture load leaves in a TMEM slot, to tell a load of what's there already (a model's limbs each load the
+// texture again) from a new one. Compared field by field: the resource by its address.
+struct XboxLoadedTexture {
+    const uint8_t* addr;
+    uint32_t origSize, size, fullLine, line, flags;
+    const void* resource;
+    uint16_t width, height;
+    float hScale, vScale;
+    bool masked, blended;
+    template <class T> static XboxLoadedTexture Of(const T& t) {
+        return { t.addr,
+                 t.orig_size_bytes,
+                 t.size_bytes,
+                 t.full_image_line_size_bytes,
+                 t.line_size_bytes,
+                 t.tex_flags,
+                 t.raw_tex_metadata.resource.get(),
+                 t.raw_tex_metadata.width,
+                 t.raw_tex_metadata.height,
+                 t.raw_tex_metadata.h_byte_scale,
+                 t.raw_tex_metadata.v_pixel_scale,
+                 t.masked,
+                 t.blended };
+    }
+    bool operator==(const XboxLoadedTexture& o) const {
+        return addr == o.addr && origSize == o.origSize && size == o.size && fullLine == o.fullLine &&
+               line == o.line && flags == o.flags && resource == o.resource && width == o.width &&
+               height == o.height && hScale == o.hScale && vScale == o.vScale && masked == o.masked &&
+               blended == o.blended;
+    }
+};
+
+// the tiles the triangles draw from: G_TEXTURE's and the one after it, or its alone from tile 2 on (GfxSpTriangles'
+// "No LOD support"). A change to another (G_TX_LOADTILE, 7, that every texture load goes through) changes no
+// triangle: what the load puts in TMEM says itself whether it changed anything, and G_TEXTURE moving onto a tile
+// marks the textures changed
+static bool XboxTileDrawn(const RDP* rdp, uint8_t tile) {
+    const uint8_t first = rdp->first_tile_index;
+    return tile == first || (first < 2 && tile == first + 1);
+}
 
 extern "C" double LusXbox_Seconds(void); // gfx_xbox.cpp
 static double sXboxRebuildSeconds;       // the replays' HwRebuildStates, for the profile line
@@ -1474,6 +1527,8 @@ void Interpreter::TextureCacheClear() {
     sXboxRawByHash.clear();
     sXboxResourceByHash.clear();
     sXboxMaskedUploads.clear();
+    sXboxLastTlut = { nullptr, UINT32_MAX, 0 };
+    mHwStateGen++;
     for (XboxTextureSlot& slot : sXboxTextureSlots) {
         slot.hash = 0;
         slot.texture.reset();
@@ -1486,8 +1541,16 @@ void Interpreter::ShaderCacheClear() {
 }
 
 bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
-    TextureCacheMap::iterator it = mTextureCache.map.find(key);
     TextureCacheNode** n = &mRenderingState.mTextures[i];
+#ifdef LUS_XBOX
+    // the texture bound there already (a new tile size or palette load over the same image): no hash, no map
+    if (*n != nullptr && (*n)->first == key) {
+        mRapi->SelectTexture(i, (*n)->second.texture_id);
+        mTextureCache.lru.splice(mTextureCache.lru.end(), mTextureCache.lru, (*n)->second.lru_location);
+        return true;
+    }
+#endif
+    TextureCacheMap::iterator it = mTextureCache.map.find(key);
 
     if (it != mTextureCache.map.end()) {
 #ifdef LUS_XBOX
@@ -1575,6 +1638,11 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
         }
     }
 #ifdef LUS_XBOX
+    // the loaded tiles imported again at their next draw: a load of the same texture no longer marks them changed
+    // (GfxDpLoadBlock), and this one's bytes may be new
+    mRdp->textures_changed[0] = true;
+    mRdp->textures_changed[1] = true;
+    mHwStateGen++;
     // a mask: the textures it was baked into (none of them is a mask, so this goes one level deep)
     for (size_t m = 0; m < sXboxMaskedUploads.size(); m++) {
         if (sXboxMaskedUploads[m].first == origAddr && sXboxMaskedUploads[m].second != origAddr) {
@@ -2280,7 +2348,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
 
     // Check if this texture address is a registered GPU framebuffer mirror.
     // If so, bind the GPU FB directly — full resolution, no CPU readback needed.
-    if (origAddr != nullptr && !importReplacement) {
+    if (origAddr != nullptr && !importReplacement && !mFbTextures.empty()) {
         auto fbIt = mFbTextures.find((uintptr_t)origAddr);
         if (fbIt != mFbTextures.end()) {
             Flush();
@@ -4209,7 +4277,13 @@ void Interpreter::GfxDpSetTile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_
         t.tmem == tmem) {
         return;
     }
-    mHwStateGen++;
+    // (the load tile: no triangle draws from it, XboxTileDrawn)
+    sXboxTileSets++;
+    if (XboxTileDrawn(mRdp, tile)) {
+        mHwStateGen++;
+    } else {
+        sXboxTileSetsUndrawn++;
+    }
 #endif
     mRdp->texture_tile[tile].palette = palette; // palette should set upper 4 bits of color index in 4b mode
     mRdp->texture_tile[tile].fmt = fmt;
@@ -4238,7 +4312,9 @@ void Interpreter::GfxDpSetTileSize(uint8_t tile, uint16_t uls, uint16_t ult, uin
     if (t.uls == uls && t.ult == ult && t.lrs == lrs && t.lrt == lrt) {
         return;
     }
-    mHwStateGen++;
+    if (XboxTileDrawn(mRdp, tile)) { // (as GfxDpSetTile)
+        mHwStateGen++;
+    }
 #endif
     mRdp->texture_tile[tile].uls = uls;
     mRdp->texture_tile[tile].ult = ult;
@@ -4255,6 +4331,18 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
     const uint8_t* src = mRdp->texture_to_load.addr;
     uint32_t entryCount = high_index + 1;
     uint32_t byteCount = entryCount * 2;
+#ifdef LUS_XBOX
+    // the same palette into the same place as the last load this frame: nothing changes (gfx_step: it says so). A new
+    // one marks the textures changed, as their cache keys hold the palette's address
+    if (src == sXboxLastTlut.src && tmem == sXboxLastTlut.tmem && entryCount == sXboxLastTlut.count &&
+        src != nullptr) {
+        return;
+    }
+    sXboxLastTlut = { src, tmem, entryCount };
+    mHwStateGen++;
+    mRdp->textures_changed[0] = true;
+    mRdp->textures_changed[1] = true;
+#endif
 
     if (tmem >= 256) {
         // N64 TMEM palette area starts at tmem word 256. Each CI4 palette = 16 entries = 16 tmem words.
@@ -4292,6 +4380,9 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
 void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
     SUPPORT_CHECK(uls == 0);
     SUPPORT_CHECK(ult == 0);
+#ifdef LUS_XBOX
+    const XboxLoadedTexture before = XboxLoadedTexture::Of(mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index]);
+#endif
 
     // The lrs field rather seems to be number of pixels to load
     uint32_t word_size_shift = 0;
@@ -4362,11 +4453,17 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
     // orig_size_bytes,
     //         mRdp->texture_to_load.siz, lrs);
 
+#ifdef LUS_XBOX
+    // (none registered, as in most scenes: no path made and looked up for each load)
+    const bool anyMasked = !mMaskedTextures.empty();
+#else
+    const bool anyMasked = true;
+#endif
     const std::string_view texPath =
-        mRdp->texture_to_load.raw_tex_metadata.resource != nullptr
+        anyMasked && mRdp->texture_to_load.raw_tex_metadata.resource != nullptr
             ? GetBaseTexturePath(mRdp->texture_to_load.raw_tex_metadata.resource->GetInitData()->Path)
             : std::string_view{};
-    auto maskedTextureIter = mMaskedTextures.find(texPath);
+    auto maskedTextureIter = anyMasked ? mMaskedTextures.find(texPath) : mMaskedTextures.end();
     if (maskedTextureIter != mMaskedTextures.end()) {
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].masked = true;
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].blended =
@@ -4376,11 +4473,25 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].blended = false;
     }
 
+#ifdef LUS_XBOX
+    // what was loaded there already (a limb loading its model's texture again): nothing to import, and the
+    // triangles' fast path goes on (gfx_step: a load says whether it changed anything)
+    sXboxTexLoads++;
+    if (XboxLoadedTexture::Of(mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index]) == before) {
+        sXboxTexLoadsSame++;
+        return;
+    }
+    mHwStateGen++;
+#endif
     mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 }
 
 void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t lrt) {
     SUPPORT_CHECK(tile == G_TX_LOADTILE);
+#ifdef LUS_XBOX
+    const XboxLoadedTexture before = XboxLoadedTexture::Of(mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index]);
+    const auto beforeTile = mRdp->texture_tile[tile];
+#endif
 
     uint32_t word_size_shift = 0;
     switch (mRdp->texture_to_load.siz) {
@@ -4432,11 +4543,16 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr = mRdp->texture_to_load.addr + start_offset_bytes;
 
+#ifdef LUS_XBOX
+    const bool anyMasked = !mMaskedTextures.empty(); // (as GfxDpLoadBlock)
+#else
+    const bool anyMasked = true;
+#endif
     const std::string_view texPath =
-        mRdp->texture_to_load.raw_tex_metadata.resource != nullptr
+        anyMasked && mRdp->texture_to_load.raw_tex_metadata.resource != nullptr
             ? GetBaseTexturePath(mRdp->texture_to_load.raw_tex_metadata.resource->GetInitData()->Path)
             : std::string_view{};
-    auto maskedTextureIter = mMaskedTextures.find(texPath);
+    auto maskedTextureIter = anyMasked ? mMaskedTextures.find(texPath) : mMaskedTextures.end();
     if (maskedTextureIter != mMaskedTextures.end()) {
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].masked = true;
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].blended =
@@ -4451,6 +4567,19 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
     mRdp->texture_tile[tile].lrs = lrs;
     mRdp->texture_tile[tile].lrt = lrt;
 
+#ifdef LUS_XBOX
+    // (as GfxDpLoadBlock: the same load again changes nothing)
+    sXboxTexLoads++;
+    const auto& t = mRdp->texture_tile[tile];
+    // (the tile's size matters only to a tile the triangles draw from: the load tile's is in what was loaded)
+    if (XboxLoadedTexture::Of(mRdp->loaded_texture[t.tmem_index]) == before &&
+        (!XboxTileDrawn(mRdp, tile) || (t.uls == beforeTile.uls && t.ult == beforeTile.ult &&
+                                        t.lrs == beforeTile.lrs && t.lrt == beforeTile.lrt))) {
+        sXboxTexLoadsSame++;
+        return;
+    }
+    mHwStateGen++;
+#endif
     mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 }
 
@@ -5082,8 +5211,38 @@ bool gfx_load_ucode_handler_f3dex2(F3DGfx** cmd) {
     return false;
 }
 
+bool gfx_end_dl_handler_common(F3DGfx** cmd0);
+
 bool gfx_cull_dl_handler_f3dex2(F3DGfx** cmd) {
-    // TODO:
+#ifdef LUS_XBOX
+    // The display list's bounding box, loaded as vertices vstart..vend: when every corner is beyond one plane for all
+    // of the tick's frames (HwVertexRisky's hwOut, the test that drops a triangle as it's recorded), so is all that
+    // the box holds (the planes are flat), and the rest of the list ends here, as the RSP ends it. Only F3DEX2's
+    // encoding (index * 2), and only vertices loaded raw for the GPU: anything else draws as before.
+    Interpreter* gfx = GfxInstance();
+    if (ucode_handler_index != ucode_f3dex2 || !gfx->mHwTnl) {
+        return false;
+    }
+    const uint32_t vstart = (uint32_t)((*cmd)->words.w0 & 0xFFFF) / 2;
+    const uint32_t vend = (uint32_t)((*cmd)->words.w1 & 0xFFFF) / 2;
+    if (vstart > vend || vend >= MAX_VERTICES) {
+        return false;
+    }
+    sXboxCullTests++;
+    uint8_t out = 0xFF;
+    for (uint32_t i = vstart; i <= vend && out != 0; i++) {
+        LoadedVertex* v = &gfx->mRsp->loaded_vertices[i];
+        if (!v->hw) {
+            return false;
+        }
+        gfx->HwVertexRisky(v);
+        out &= v->hwOut;
+    }
+    if (out != 0) {
+        sXboxCulled++;
+        return gfx_end_dl_handler_common(cmd);
+    }
+#endif
     return false;
 }
 
@@ -6709,7 +6868,10 @@ static bool XboxHandlerKeepsTriState(uint8_t opcode) {
     } else if (ucode_handler_index < ucode_handlers.size() && ucode_handlers[ucode_handler_index]->contains(op)) {
         h = ucode_handlers[ucode_handler_index]->at(op).second;
     }
-    return h == gfx_tri1_handler_f3dex2 || h == gfx_tri1_handler_f3dex || h == gfx_tri1_handler_f3d ||
+    // (a texture image only names what a load will take: the load is what changes the triangles' state)
+    return h == gfx_set_timg_handler_rdp || h == gfx_set_timg_otr_hash_handler_custom ||
+           h == gfx_set_timg_otr_filepath_handler_custom || h == gfx_tri1_handler_f3dex2 ||
+           h == gfx_tri1_handler_f3dex || h == gfx_tri1_handler_f3d ||
            h == gfx_tri2_handler_f3dex || h == gfx_quad_handler_f3dex2 || h == gfx_quad_handler_f3dex ||
            h == gfx_tri1_otr_handler_f3dex2 || h == gfx_vtx_handler_f3dex2 || h == gfx_vtx_handler_f3dex ||
            h == gfx_vtx_handler_f3d || h == gfx_vtx_hash_handler_custom || h == gfx_vtx_otr_filepath_handler_custom ||
@@ -6738,7 +6900,8 @@ static bool XboxHandlerSaysIfChanged(uint8_t opcode) {
            h == gfx_set_prim_color_handler_rdp || h == gfx_set_env_color_handler_rdp ||
            h == gfx_set_fog_color_handler_rdp || h == gfx_othermode_l_handler_f3dex2 ||
            h == gfx_othermode_h_handler_f3dex2 || h == gfx_rdp_set_other_mode_rdp ||
-           h == gfx_geometry_mode_handler_f3dex2 || h == gfx_texture_handler_f3dex2;
+           h == gfx_geometry_mode_handler_f3dex2 || h == gfx_texture_handler_f3dex2 || h == gfx_load_block_handler_rdp ||
+           h == gfx_load_block_wide_handler_rdp || h == gfx_load_tile_handler_rdp || h == gfx_load_tlut_handler_rdp;
 }
 
 // the same, worked out once a microcode and opcode (~12,000 commands a frame)
@@ -7123,6 +7286,11 @@ static void XboxLogProfile(uint64_t hwTriangles, uint64_t litTriangles, uint64_t
     for (int k = 0; k < 8 && sXboxFastEnders[order[k]] / sXboxRuns != 0; k++) {
         line += fmt::format(" {} {}", opName(order[k]), sXboxFastEnders[order[k]] / sXboxRuns);
     }
+    line += fmt::format("; texture loads {} ({} of what was loaded), display lists culled {} of {} tested, tile "
+                        "changes {} ({} to a tile not drawn)",
+                        sXboxTexLoads / sXboxRuns, sXboxTexLoadsSame / sXboxRuns, sXboxCulled / sXboxRuns,
+                        sXboxCullTests / sXboxRuns, sXboxTileSets / sXboxRuns, sXboxTileSetsUndrawn / sXboxRuns);
+    sXboxTexLoads = sXboxTexLoadsSame = sXboxCulled = sXboxCullTests = sXboxTileSets = sXboxTileSetsUndrawn = 0;
     sXboxDropped = sXboxCuts = sXboxPieces = 0;
     sXboxSlowCycles = sXboxCutCycles = 0;
     memset(sXboxSlowWhy, 0, sizeof(sXboxSlowWhy));
@@ -7155,6 +7323,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     LusXbox_Where("rendering: the display list");
     uint64_t xboxRunStart = XboxCycles();
     sXboxProfileRun = sXboxRuns == 50;
+    sXboxLastTlut = { nullptr, UINT32_MAX, 0 };
     mHwTnl = mRapi->SupportsHwTnl();
     mHwStates.clear(); // a frame's: its vertices index them
     mHwRecipes.clear();
